@@ -3,22 +3,56 @@
 # SPDX-License-Identifier: CC0-1.0
 
 # The name needs to match the filename of this config.
-name: "testing"
+name: "adriatic-focus"
+
+# The scenario and intersection_scenarios config is used only in order
+# to determine which results are required for the various "*_all_*"
+# Snakemake rules. Each entry corresponds to a Snakemake wildcard.
+# Multiple values may be specified for each wildcard; all combinations
+# will be computed. See the Snakefile for a description of each
+# wildcard.
 
 intersection_scenarios:
-# Note that we have defined `eps` also above for the scenario.
   eps: ["0.05uni"] 
   common:
     simpl: ""
-    clusters: "2-2-1"
+    # Number of clusters in focus region, neighbouring countries and
+    # the rest of the network.
+    clusters: "30-20-10"
+    # Total transmission network expansion may not exceed 25% in
+    # volume (single constraint for whole network, not applied to
+    # individual lines).
     lv: "1.25"
+    # Costs are for 2050
     planning_horizons: "2050"
-    # Note that we have defined `sector_opts` also above for the scenario.
-    sector_opts: "Co2L0-1H-50seg-T-H-B-I-A-solar+p3-EQ0.8c"
+    # Other options:
+    # - Co2L0: Limit CO2 emissions to 0,
+    # - 1500seg: Cluster time dimension to 1500 segments (note that 1H
+    #   option is made redundant by this but still needed for the code
+    #   to work),
+    # - T: transport sector
+    # - H: heat sector
+    # - B: biomass sector
+    # - I: industry sector
+    # - A: agriculture sector
+    # - EQ0.75c: enforce 75% of electricity demand to be met by
+    #   local production for each country.
+    sector_opts: "Co2L0-1H-1500seg-T-H-B-I-A-EQ0.75c"
   scenarios:
-    expensive-wind-1987: {year: "1987", sector_opts: "onwind+c1.3-offwind+c1.3"}
-    expensive-solar-1987: {year: "1987", sector_opts: "solar+c1.3"}
-    baseline-1987: {year: "1987"}
+    # Note: 24% and 39% cost increases for onshore wind and solar
+    # respectively are taken from the upper cost range given by DEA (Sheet 20: Nominal investment/22: *total, per DC).
+    expensive-wind-1987: {year: "1987", sector_opts: "solar+p3-onwind+c1.24-offwind+c1.24"}
+    expensive-solar-1987: {year: "1987", sector_opts: "solar+p3-solar+c1.39"}
+    baseline-1987: {year: "1987", sector_opts: "solar+p3"}
+    expensive-wind-2010: {year: "2010", sector_opts: "solar+p3-onwind+c1.24-offwind+c1.24"}
+    expensive-solar-2010: {year: "2010", sector_opts: "solar+p3-solar+c1.39"}
+    baseline-2010: {year: "2010", sector_opts: "solar+p3"}
+    expensive-wind-1985: {year: "1985", sector_opts: "solar+p3-onwind+c1.24-offwind+c1.24"}
+    expensive-solar-1985: {year: "1985", sector_opts: "solar+p3-solar+c1.39"}
+    baseline-1985: {year: "1985", sector_opts: "solar+p3"}
+    landuse-1987: {year: "1987"}
+    landuse-2010: {year: "2010"}
+    landuse-1985: {year: "1985"}
 
 # The following config section relates to how the near-optimal
 # feasible space is approximated.
@@ -32,14 +66,14 @@ near_opt_approx:
   directions_angle_separation: 45
   # The number of parallel solvers used in the near-optimal feasible
   # space approximation.
-  num_parallel_solvers: 10
+  num_parallel_solvers: 8
 
   # Convergence configuration. All in all, the below means that the
   # near-optimal space approximation will terminate when the volume
   # changes by less than `conv_epsilon` percent for any `conv_iterations` 
   # consecutive iterations, or after `iterations` iterations at most. 
   # Number of iterations.
-  iterations: 30
+  iterations: 450
   # Convergence method, either "centre" or "volume".
   conv_method: "volume"
   # Convergence epsilon in percent.
@@ -47,20 +81,27 @@ near_opt_approx:
   # Number of iterations for which the convergence criterion must be
   # below the convergence epsilon before the approximation stops.
   conv_iterations: 50
-
+  
   # Command line options for the `qhull` program, which is used to
-  # compute convex hulls, may be defined here. Whatever the options
-  # used, it should work well with inputs that are scaled to the unit
-  # cube. (See http://www.qhull.org/html/qh-optq.htm for more details
-  # about options).
+  # compute convex hulls, may be defined here. The default options
+  # usually work well in which case this is not needed. If qhull fails
+  # for any reason, one could try to options "W1e-6 C1e-6 Q12" to get
+  # an approximate convex hull computation (see
+  # http://www.qhull.org/html/qh-optq.htm).
   qhull_options:
     # Used for routine convex hull computations (e.g. in compute_near_opt)
-    near_opt: "Qt"
+    near_opt: "Qt C1e-3 W1e-3 Q14 Qx"
     # Used when an approximate convex hull computation is needed
     # (input spaces in intersection computation)
-    near_opt_approx: "Qt C5e-3 W1e-2"
+    near_opt_approx: "Qt C1e-3 W1e-3 Q14 Qx"
     # Used for halfspace intersection computations
     intersection: "Qt C5e-3 W1e-2"
+
+  # Optionally use pre_clustering to reduce the number of constraints
+  # used to compute intersections of convex hulls.
+  intersection_pre_cluster:
+    enabled: True
+    n_clusters: 20000
 
   # Angle tolerance: when no new directions are found which are at
   # least this number of degrees away from previously used directions,
@@ -93,7 +134,6 @@ projection:
     - {regions: "in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "SMR"}
     - {regions: "in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "SMR CC"}
     - {regions: "in", c: "Store", v: "e_nom", weight: "capital_cost", scale_by_years: True, carrier: "H2"}
-    # - {regions: "in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "H2 liquefaction"} # Only if activated.
   hydrogen-out:
     - {regions: "not-in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "H2 Electrolysis"}
     - {regions: "not-in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "H2 Fuel Cell"}
@@ -104,7 +144,6 @@ projection:
     - {regions: "not-in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "SMR"}
     - {regions: "not-in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "SMR CC"}
     - {regions: "not-in", c: "Store", v: "e_nom", weight: "capital_cost", scale_by_years: True, carrier: "H2"}
-  # - {regions: "not-in", c: "Link", v: "p_nom", weight: "capital_cost", scale_by_years: True, carrier: "H2 liquefaction"} # Only if activated.
 
 # Provide some readable labels of the above dimensions for figures.
 projection_labels:
@@ -116,7 +155,7 @@ projection_labels:
   offwind-out: "Offshore wind (out)"
   hydrogen-in: "H2 infr. (in)"
   hydrogen-out: "H2 infr. (out)"
-
+  
 # Here, specify what we mean if the above projection specification
 # includes named regions of the form "regions: foo". That option will
 # be translated according to the below config, such that, for example,
@@ -124,8 +163,21 @@ projection_labels:
 # "foo: ['DE', 'NL', 'BE']" below. Additionally, "not-foo" will be
 # translated to a list of all countries _not_ in "foo".
 projection_regions:
-  in: ["BE"]
+  in: ["IT", "HR", "BA", "MT", "AL", "GR"]
 
+# This is to configure computation of robust networks (i.e. located in
+# the intersection), used to calculation export ranges.
+robust_networks:
+  num_robust: 400
+  num_parallel: 12
+  dim_groups:
+    - ["onwind-in", "offwind-in", "solar-in"]
+    - ["hydrogen-in"]
+    - ["onwind-out", "offwind-out", "solar-out"]
+    - ["hydrogen-out"]
+  robust_base: "baseline-2010"
+  opts_substitutions:
+    "1500seg": "500seg"
 
 # Apply some formatting to the logging so each entry shows the time it was logged.
 logging:
@@ -145,12 +197,17 @@ pypsa-eur:
     drop_leap_days: true
 
   focus_clustering:
-    countries: ["BE"]
+    countries: ["IT", "HR", "BA", "MT", "AL", "GR"]
 
   clustering:
+    constant_weather_year: "1985"
     cluster_network:
       algorithm: "hac"
     aggregation_strategies:
+      # We need to provide an aggregation strategy for p_max_pu
+      # (constant capacity factor, not time-dependent in this case)
+      # because nuclear generators from different countries with
+      # different capacity factors need to be aggregated.
       generators:
         p_max_pu: mean
 
@@ -179,6 +236,11 @@ pypsa-eur:
     # Make this a greenfield optimisation w.r.t. renewables.
     estimate_renewable_capacities:
       enable: false
+
+  # load:
+  #   # Baseline in European Commission scenario from
+  #   # https://ec.europa.eu/clima/eu-action/european-green-deal/2030-climate-target-plan_en
+  #   scaling_factor: 1.13
 
   atlite:
     nprocesses: 4
@@ -214,9 +276,9 @@ pypsa-eur:
     use-scratch: true
     solver:
       name: "gurobi"
-      LogToConsole: 0
-      OutputFlag: 0
-      threads: 1
+      LogToConsole: 1
+      OutputFlag: 1
+      threads: 4
       method: 2 # barrier
       crossover: 0
       BarConvTol: 1.e-5
@@ -230,8 +292,6 @@ pypsa-eur-sec:
   atlite:
     cutout: europe-era5_{weather_year}
     drop_leap_day: true
-
-  countries: ["BE", "NL", "DE", "DK", "PL"]
 
   sector:
     gas_network: true

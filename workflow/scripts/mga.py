@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2022 Koen van Greevenbroek & Aleksander Grochowicz
+# SPDX-FileCopyrightText: 2023 Koen van Greevenbroek & Aleksander Grochowicz
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -15,15 +15,27 @@ import logging
 import multiprocessing
 import os
 import time
+import warnings
 from collections import OrderedDict
-from multiprocessing import Pool
+from multiprocessing import Pool, get_context
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
-import pypsa
 from _helpers import configure_logging
-from utilities import get_basis_values, solve_network_in_direction
+from utilities import (
+    get_basis_values,
+    override_component_attrs,
+    solve_network_in_direction,
+)
+from workflow_utilities import parse_net_spec
+
+# Ignore futurewarnings raised by pandas from inside pypsa, at least
+# until the warning is fixed. This needs to be done _before_ pypsa and
+# pandas are imported; ignore the warning this generates.
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+import pandas as pd  # noqa: E402
+import pypsa  # noqa: E402
 
 
 def mga(
@@ -77,7 +89,9 @@ def mga(
         (MGA) space of the given model.
     """
     # Make a copy of the input network so we do not modify the arguments.
-    m = copy.deepcopy(n)
+    m = n.copy()
+    m.config = n.config
+    m.opts = n.opts
 
     # Prepare the near-optimal feasible space, represented by a
     # collection of points. Initially, it just contains the optimal
@@ -97,7 +111,7 @@ def mga(
 
     # Start a pool of worker processes:
     logging.info("Starting MGA optimisations.")
-    with Pool(num_parallel_solvers) as pool:
+    with get_context("spawn").Pool(num_parallel_solvers) as pool:
         args = [
             (m, d, basis, obj_bound, debug_dir, desc)
             for d, desc in zip(mga_directions, descriptions)
@@ -128,23 +142,52 @@ def mga_worker(
     worker_name = multiprocessing.current_process().name
     print(f"{worker_name}: Solving for {description}...")
 
+    m = n.copy()
+    m.config = n.config
+    m.opts = n.opts
+
     # Solve the network.
     t = time.time()
-    status, _ = solve_network_in_direction(n, direction, basis, obj_bound)
+    status, termination_condition = solve_network_in_direction(
+        m, direction, basis, obj_bound
+    )
     solve_time = round(time.time() - t)
     print(f"{worker_name}: Finished solving for {description} in {solve_time} seconds")
 
-    # Export the network for debug purposes.
-    n.export_to_netcdf(os.path.join(debug_dir, f"{description}.nc"))
+    # Export the network for debug purposes. Don't worry if this fails
+    # for some reason.
+    try:
+        m.export_to_netcdf(
+            os.path.join(debug_dir, f"{description}.nc"),
+            compression={
+                "complevel": 1,
+                "zlib": True,
+                "least_significant_digit": 3,
+            },
+        )
+    except Exception as e:
+        print(f"{worker_name}: Failed to export network for {description}: {e}")
 
     # If the solve was successful, return the results. Otherwise,
     # return nothing. Unsuccessful solves can happen sporadically due
     # to, for example, numerical issues.
     if status == "ok":
-        return get_basis_values(n, basis)
+        return get_basis_values(m, basis)
     else:
-        print("Optimisation unsuccessful: ignoring results.")
-        return None
+        # If the status is not "ok" (in which case it's "warning"),
+        # it's possible that the network still contains useful but
+        # sub-optimal results. This is the case when the termination
+        # condition is "suboptimal". We print a warning but still use
+        # the results.
+        if termination_condition == "suboptimal":
+            print(
+                f"{worker_name}: Suboptimal solution for {description};"
+                " still using results."
+            )
+            return get_basis_values(m, basis)
+        else:
+            print(f"{worker_name}: Optimisation unsuccessful: ignoring results.")
+            return None
 
 
 if __name__ == "__main__":
@@ -155,11 +198,14 @@ if __name__ == "__main__":
     pypsa_logger = logging.getLogger("pypsa")
     pypsa_logger.setLevel(logging.WARNING)
 
-    # Load the network.
-    n = pypsa.Network(snakemake.input.network)
+    # Load the network and solving options.
+    overrides = override_component_attrs(snakemake.params.overrides)
+    n = pypsa.Network(snakemake.input.network, override_component_attrs=overrides)
 
     # Attach solving configuration to the network.
-    n.config = snakemake.config["pypsa-eur"]
+    # TODO: what if we run this with pypsa-eur, not pypsa-eur-sec?
+    n.config = snakemake.config["pypsa-eur-sec"]
+    n.opts = parse_net_spec(snakemake.wildcards.spec)["sector_opts"].split("-")
 
     # Load other inputs (the optimal point, the near-optimality
     # constraint) to the MGA computation.

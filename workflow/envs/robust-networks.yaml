@@ -13,6 +13,7 @@ dependencies:
   - mamba
 
   - pypsa==0.23.0
+  - tsam
   - gurobi
 
   # Dependencies of the workflow itself

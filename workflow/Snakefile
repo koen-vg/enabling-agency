@@ -2,18 +2,23 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import hashlib
+import math
 import os
+import re
 import yaml
 import shutil
 import snakemake
+import subprocess
 from pathlib import Path
 
-from scripts._helpers import parse_year_wildcard
 from scripts.workflow_utilities import (
-    soft_copy_pypsa_eur,
-    validate_configs,
+    build_intersection_scenarios,
     hash_config,
     parse_net_spec,
+    parse_year_wildcard,
+    translate_projection_regions,
+    validate_config,
 )
 
 from snakemake.utils import min_version
@@ -22,9 +27,28 @@ from snakemake.utils import min_version
 # keyword support.
 min_version("7.0.1")
 
+# If we are running in cluster mode, set the shadow prefix to the $SCRATCH
+# directory. This will copy rule input files to the local scratch directory, and
+# output files back. This is to prevent too much load on the shared filesystem.
+if workflow.run_local and os.environ.get("SCRATCH") is not None:
+    workflow.shadow_prefix = os.environ.get("SCRATCH")
+
+if workflow.shadow_prefix:
+    print(f"Using shadow prefix {workflow.shadow_prefix}")
+
+
 # First, validate the configuration files to make sure we do not make
 # any silly mistakes.
-validate_configs("config")
+validate_config(config)
+
+# If specified in the config, override solving/tmpdir config with
+# $SCRATCH, if defined.
+if config["pypsa-eur"]["solving"].get("use-scratch", False) and "SCRATCH" in os.environ:
+    config["pypsa-eur"]["solving"]["tmpdir"] = os.environ["SCRATCH"]
+
+# Specify the maximum amount of time that jobs are allowed to run for.
+# This is used by the cluster profile to set the maximum walltime.
+MAX_RUNTIME = 5 * 24 * 60  # 5 days in minutes
 
 # Each snakemake run is defined by a named configuration file, which
 # is given as a command-line argument. This name is constant for the
@@ -38,82 +62,56 @@ networks_dir = "networks/" + run_name
 # files. Does not hash the values iterations, conv_epsilon,
 # conv_iterations of the "near_opt_approx" config.
 hash_run = hash_config(config)
-cache_dir = os.path.join("cache", run_name, hash_run)
-config_file = os.path.join(cache_dir, f"config-{run_name}.yaml")
-Path(cache_dir).mkdir(parents=True, exist_ok=True)
+cache_dir = Path(workflow.current_basedir).parent / "cache" / run_name / hash_run
+debug_dir = Path(workflow.current_basedir).parent / "debug" / run_name / hash_run
+config_file = cache_dir / f"config-{run_name}.yaml"
+cache_dir.mkdir(parents=True, exist_ok=True)
 with open(config_file, "w") as f:
     yaml.dump(config, f)
 
-# The configuration contains a section of pypsa-eur config, which we
-# extract and put in a separate file.
-pypsa_eur_config = config["pypsa-eur"]
+print(
+    f"If running compute_near_opt, using cache directory 'cache/{run_name}/{hash_run}'"
+)
 
-# We use pypsa-eur as a module, but make sure that we have a separate
-# pypsa-eur instance for each named model run.
-pypsa_eur_base_dir = "workflow/modules/pypsa-eur-base"
-pypsa_eur_run_dir = f"workflow/modules/pypsa-eur-{run_name}"
-if not Path(pypsa_eur_run_dir).exists():
-    soft_copy_pypsa_eur(pypsa_eur_base_dir, pypsa_eur_run_dir)
+# Extract the custom pypsa-eur config section from the top-level
+# workflow config, and update the "run" section.
+custom_pypsa_eur_config = config["pypsa-eur"]
+custom_pypsa_eur_config["run"]["name"] = run_name
 
-# For some reason, the workdir of a module must be relative to
-# this Snakefile (.), not the workdir of the current snakemake
-# workflow (..).
-pypsa_eur_run_dir_rel = f"modules/pypsa-eur-{run_name}"
+# Same for pypsa-eur-sec config
+custom_pypsa_eur_sec_config = config.get("pypsa-eur-sec", {})
+custom_pypsa_eur_sec_config["run"] = run_name
 
-# Read the default pypsa-eur config, and use it as a base for the
-# user-supplied pypsa-eur config.
-with open(os.path.join(pypsa_eur_base_dir, "config.default.yaml"), "r") as f:
+# Read the default pypsa-eur config, and update it using our custom config.
+with open(workflow.source_path("modules/pypsa-eur/config.default.yaml"), "r") as f:
     pypsa_eur_config = yaml.safe_load(f)
-snakemake.utils.update_config(pypsa_eur_config, config["pypsa-eur"])
-snakemake.utils.update_config(config["pypsa-eur"], pypsa_eur_config)
+snakemake.utils.update_config(pypsa_eur_config, custom_pypsa_eur_config)
+
+# Same for pypsa-eur-sec config
+with open(workflow.source_path("modules/pypsa-eur-sec/config.default.yaml"), "r") as f:
+    pypsa_eur_sec_config = yaml.safe_load(f)
+snakemake.utils.update_config(pypsa_eur_sec_config, custom_pypsa_eur_sec_config)
+
+# Additionally, add the pypsa-eur config to the pypsa-eur-sec config too
+pypsa_eur_sec_config["pypsa_eur_config"] = pypsa_eur_config
+
+# Override pypsa-eur-sec solving config with pypsa-eur solving config
+# TODO: This is a bit hacky, but it's the easiest way to satisfy pypsa-eur-sec
+pypsa_eur_config["solving"]["mem"] = pypsa_eur_sec_config["solving"]["mem"]
+pypsa_eur_sec_config["solving"] = pypsa_eur_config["solving"]
+
+# Some rules in this workflow need access to the pypsa-eur-sec config
+config["pypsa-eur-sec"] = pypsa_eur_sec_config
 
 
-# Define the pypsa-eur module.
-module pypsaeur:
-    snakefile:
-        os.path.join(pypsa_eur_run_dir_rel, "Snakefile")
-    config:
-        config["pypsa-eur"]
-    prefix:
-        pypsa_eur_run_dir
-
-
-use rule * from pypsaeur as pypsaeur_*
-
-
-wildcard_constraints:
-    # Wildcards from pypsa-eur:
-    simpl="[a-zA-Z0-9]*|all",
-    clusters="[0-9]+m?|all",
-    ll="(v|c)([0-9\.]+|opt|all)|all",
-    opts="[-+a-zA-Z0-9\.]*",
-    # The {year} wildcard represents a set of years and consists of a
-    # number of single years or ranges (of the form 2000-2020) all
-    # separated by `+`s. Example: "1980+1990-2000+2020".
-    year="([0-9]+)(-[0-9]+)?(\+([0-9]+)(-[0-9]+)?)*",
-    intersectionyears="([0-9]+)(-[0-9]+)?(\+([0-9]+)(-[0-9]+)?)*",
-    # MAA-related wildcards:
-    # {eps} for 'epsilon' is a floating point number, optionally
-    # followed by the suffix "uni<year>", where <year> conforms to the
-    # same format as the {year} wildcard. Examples: "0.15",
-    # "0.2uni1980-2020".
-    eps="[0-9\.]+(uni([0-9]+)(-[0-9]+)?(\+([0-9]+)(-[0-9]+)?)*)?",
-    # {epsf} for 'epsilon float' is just a floating point number, for
-    # when we want to exclude the possibility of a "uni" bound in the
-    # {eps} wildcard. Example: "0.15".
-    epsf="[0-9\.]+",
-    # {method} refers to a method of computing a robust solution, and
-    # allows a few different options. Example: "mean".
-    method="(exact|mean|naive|conservative)",
-    # {operation_method} determines how to operate networks; either
-    # normally or year-by-year (i.e. operate each year the network is
-    # defined over separately). In these cases the wildcard is empty
-    # or "-single-years" respectively.
-    operation_method="(-single-years)?",
-    # {with_budget} is a simple "flag" wildcard, indicating in the
-    # filename whether the operations of a network are solved with a
-    # budget or not.
-    with_budget="(_B)?",
+# Process the projection specification in this config to translate
+# region names to explicit lists of countries.
+if "projection_regions" in config:
+    config["projection"] = translate_projection_regions(
+        config["projection"],
+        config["projection_regions"],
+        pypsa_eur_config["countries"],
+    )
 
 
 # Set the number of threads to use for network optimisations.
@@ -121,103 +119,204 @@ wildcard_constraints:
 grb_threads = config["pypsa-eur"]["solving"]["solver"]["threads"]
 parallel_threads = grb_threads * config["near_opt_approx"]["num_parallel_solvers"]
 
+# With PyPSA-Eur-Sec to override certain component attributes that are
+# not used in PyPSA-Eur.
+override_dir = "modules/pypsa-eur-sec/data/override_component_attrs"
+# Resolve the path relative to the snakemake workflow and make sure it
+# exists.
+override_dir = workflow.current_basedir.join(override_dir)
+Path(override_dir).mkdir(parents=True, exist_ok=True)
 
-rule compute_all_near_opt:
-    input:
-        expand(
-            os.path.join(
-                results_dir,
-                "near_opt/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.csv",
+# Use the following to expand scenario configs
+spec = "{year}_{simpl}_{clusters}_{lv}_{sector_opts}_{planning_horizons}"
+
+
+# Some results depend on collections on model scenarios. Since the
+# snakemake rule DAG is based on filenames, we need to encode these
+# entire collections of scenarios in filenames. However, since a list
+# of scenarios (each containing wildcards relating to resolution,
+# technologies, etc.) would make for very long filenames, we instead
+# hash collections of scenarios and use the hash in filenames instead.
+# The `scenario_collections` dictionary records the collection of
+# scenarios corresponding to each hash value. (We keep a dictionary
+# with multiple hash values since different rules, which may be run
+# within the same workflow, may work with different scenario
+# specifications.)
+scenario_collections = {}
+
+if "intersection_scenarios" in config:
+    intersection_scenarios = build_intersection_scenarios(
+        config["intersection_scenarios"]
+    )
+    int_sce_hash = hashlib.md5("".join(intersection_scenarios).encode()).hexdigest()[:8]
+    scenario_collections[int_sce_hash] = intersection_scenarios
+
+if "scenario" in config:
+    near_opt_scenarios = expand(spec + "_e{eps}", **config["scenario"])
+    near_opt_hash = hashlib.md5("".join(near_opt_scenarios).encode()).hexdigest()[:8]
+    scenario_collections[near_opt_hash] = near_opt_scenarios
+
+
+# Define the pypsa-eur-sec module.
+module pypsaeursec:
+    snakefile:
+        "modules/pypsa-eur-sec/Snakefile"
+    config:
+        pypsa_eur_sec_config
+    prefix:
+        "workflow/modules/pypsa-eur-sec"
+
+
+use rule * from pypsaeursec as pypsaeursec_*
+
+
+wildcard_constraints:
+    # wildcards from pypsa-eur(-sec):
+    simpl="[a-za-z0-9]*|all",
+    clusters="[0-9]+m?|all|[0-9]+-[0-9]+-[0-9]+",
+    ll=r"(v|c)([0-9\.]+|opt|all)|all",
+    lv=r"[a-z0-9\.]+",
+    opts=r"[-+a-zA-Z0-9\.]*",
+    sector_opts=r"[-+a-zA-Z0-9\.\s]*",
+    planning_horizons="[0-9]{4}|",
+    # The {name} wildcard is used as an option prefix giving a
+    # descriptive name. As a wildcard, it must end with an underscore
+    # to separate it cleanly from the rest of filenames.
+    name="([-a-z0-9]*[a-z]+[-a-z0-9]*_)?",
+    # The {year} wildcard represents a set of years and consists of a
+    # number of single years or ranges (of the form 2000-2020) all
+    # separated by `+`s. Example: "1980+1990-2000+2020".
+    year=r"([0-9]+)(-[0-9]+)?(\+([0-9]+)(-[0-9]+)?)*",
+    # MAA-related wildcards:
+    # {eps} for 'epsilon' is a floating point number, optionally
+    # followed by the suffix "uni".
+    eps=r"[0-9\.]+(uni)?",
+    # {epsf} for 'epsilon float' is just a floating point number, for
+    # when we want to exclude the possibility of a "uni" bound in the
+    # {eps} wildcard. Example: "0.15".
+    epsf=r"[0-9\.]+",
+    # {scenario_hash} is a hex digest of an md5 hash of a collection
+    # of scenarios, used to identify said scenarios.
+    scenario_hash="[0-9a-f]{8}",
+
+
+localrules:
+    build_all_networks,
+    compute_all_optimum,
+    compute_all_near_opt,
+    compute_all_intersections,
+    compute_all_robust_networks,
+    build_network_sec,
+    calc_obj_bound,
+
+
+localrules:
+    pypsaeursec_all,
+    pypsaeursec_solve_all_networks,
+    pypsaeursec_prepare_sector_networks,
+    pypsaeursec_retrieve_sector_databundle,
+    pypsaeursec_retrieve_gas_infrastructure_data,
+    pypsaeursec_plot_network,
+    pypsaeursec_copy_config,
+    pypsaeursec_make_summary,
+    pypsaeursec_plot_summary,
+
+
+localrules:
+    pypsaeursec_pypsaeur_cluster_all_networks,
+    pypsaeursec_pypsaeur_extra_components_all_networks,
+    pypsaeursec_pypsaeur_prepare_all_networks,
+    pypsaeursec_pypsaeur_solve_all_networks,
+    pypsaeursec_pypsaeur_prepare_links_p_nom,
+    pypsaeursec_pypsaeur_retrieve_databundle,
+    pypsaeursec_pypsaeur_retrieve_load_data,
+    pypsaeursec_pypsaeur_retrieve_artificial_load_data,
+    pypsaeursec_pypsaeur_build_cutout,
+    pypsaeursec_pypsaeur_build_cutout_year,
+    pypsaeursec_pypsaeur_retrieve_cutout,
+    pypsaeursec_pypsaeur_retrieve_cost_data,
+    pypsaeursec_pypsaeur_retrieve_natura_raster,
+    pypsaeursec_pypsaeur_retrieve_ship_raster,
+    pypsaeursec_pypsaeur_plot_network,
+    pypsaeursec_pypsaeur_make_summary,
+    pypsaeursec_pypsaeur_plot_summary,
+    pypsaeursec_pypsaeur_plot_p_nom_max,
+
+
+# Note: the "scenario" section of the config is a little outdated but
+# can still be used to compute "plain" near-optimal spaces.
+if "scenario" in config:
+
+    rule build_all_networks:
+        input:
+            expand(
+                os.path.join(
+                    networks_dir,
+                    spec + ".nc",
+                ),
+                **config["scenario"]
             ),
-            **config["scenario"]
-        ),
 
-
-rule compute_all_intersections:
-    input:
-        expand(
-            os.path.join(
-                results_dir,
-                "intersection/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.csv",
+    rule compute_all_optimum:
+        input:
+            expand(
+                os.path.join(results_dir, "optimum/" + spec + ".nc"),
+                **config["scenario"]
             ),
-            **config["scenario"]
-        ),
 
-
-rule compute_all_robust:
-    input:
-        expand(
-            os.path.join(
-                results_dir,
-                "robust/{method}/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.nc",
+    rule compute_all_near_opt:
+        input:
+            expand(
+                os.path.join(
+                    results_dir,
+                    "near_opt/" + spec + "_e{eps}_" + near_opt_sce_hash + ".csv",
+                ),
+                **config["scenario"]
             ),
-            **config["scenario"]
-        ),
 
 
-rule compute_all_robust_exact:
+if "intersection_scenarios" in config:
+
+    rule build_all_networks:
+        input:
+            [
+                os.path.join(networks_dir, f"{scenario}.nc")
+                for scenario in intersection_scenarios
+            ],
+
+    rule compute_all_optimum:
+        input:
+            [
+                os.path.join(results_dir, f"optimum/{scenario}.nc")
+                for scenario in intersection_scenarios
+            ],
+
+    rule compute_all_intersections:
+        input:
+            [
+                os.path.join(
+                    results_dir, f"intersection/intersection_e{eps}_{int_sce_hash}.csv"
+                )
+                for eps in config["intersection_scenarios"]["eps"]
+            ],
+
+
+# Rule to invoke the pypsa-eur-sec snakemake module and copy the
+# result to the networks directory. Note that we leave the {opts}
+# wildcard completely empty here (the "__" between the lv and
+# sector_opts wildcards) since this wildcard is not used by
+# pypsa-eur-sec and is always empty. Local rule.
+rule build_network_sec:
     input:
-        expand(
-            os.path.join(
-                results_dir,
-                "robust/exact/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.nc",
-            ),
-            **config["scenario"]
+        f"workflow/modules/pypsa-eur-sec/results/{run_name}/prenetworks/"
+        + "elec{year}_s{simpl}_{clusters}_lv{lv}__{sector_opts}_{planning_horizons}.nc",
+    output:
+        os.path.join(
+            networks_dir,
+            "{name}{year}_{simpl}_{clusters}_{lv}_{sector_opts}_{planning_horizons}.nc",
         ),
-
-
-rule compute_all_robust_mean:
-    input:
-        expand(
-            os.path.join(
-                results_dir,
-                "robust/mean/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.nc",
-            ),
-            **config["scenario"]
-        ),
-
-
-rule validate_robust:
-    input:
-        expand(
-            os.path.join(
-                results_dir,
-                "robust-summary{operation_method}/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.csv",
-            ),
-            **config["scenario"]
-        ),
-
-
-rule validate_robust_with_budget:
-    input:
-        expand(
-            os.path.join(
-                results_dir,
-                "robust-summary{operation_method}_B/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.csv",
-            ),
-            **config["scenario"]
-        ),
-
-
-rule validate_all:
-    input:
-        expand(
-            os.path.join(
-                results_dir,
-                "robust-validation-summary{operation_method}/{method}/{year}_{simpl}_{clusters}_l{ll}_{opts}_e{eps}.csv",
-            ),
-            **config["scenario"]
-        ),
-
-
-rule compute_all_optimum:
-    input:
-        expand(
-            os.path.join(
-                results_dir, "optimum/{year}_{simpl}_{clusters}_l{ll}_{opts}.nc"
-            ),
-            **config["scenario"]
-        ),
+    shell:
+        "cp {input} {output}"
 
 
 def optimisation_memory(wildcards):
@@ -240,15 +339,27 @@ def optimisation_memory(wildcards):
     """
     # Parse the network specs
     s = parse_net_spec(wildcards.spec)
+
     # Compute a multiplicative factor based on time resolution.
     h = 1
-    for o in s["opts"].split("-"):
+    opts = s["opts"] if "opts" in s else s["sector_opts"]
+
+    # First try to get time resolution from "xH" opt
+    for o in opts.split("-"):
         m = re.match(r"^(\d+)h$", o, re.IGNORECASE)
         if m is not None:
             h = int(m.group(1))
             break
 
-    # Also divide this factor by the number of years the model runs over.
+    # In case there's a time segmentation opt, it takes precedence
+    for o in opts.split("-"):
+        # Time series segmentation
+        m = re.match(r"^(\d+)seg$", o, re.IGNORECASE)
+        if m is not None:
+            h = 8760 / int(m.group(1))
+            break
+
+    # Divide the time resolution factor by the number of years the model runs over.
     year = s["year"] if s["year"] else wildcards.year
     num_years = len(parse_year_wildcard(year))
     h = h / num_years
@@ -259,23 +370,81 @@ def optimisation_memory(wildcards):
     if s["clusters"].endswith("m"):
         clusters = int(s["clusters"][:-1])
         simpl = int(s["simpl"])
+    elif "-" in s["clusters"]:
+        clusters = sum(map(int, s["clusters"].split("-")))
+        simpl = clusters
     else:
         clusters = int(s["clusters"])
         simpl = clusters
 
+    # This regression doesn't work well for low time resolutions,
+    # so lower bound h in the following calculation.
+    h = min(h, 12)
+
     mem = -1000 - 5 * simpl + 41 * clusters + 92 * (simpl + clusters) / h + 5600 / h
-    return 1.05 * mem
+
+    # This is crude estimation for pypsa-eur-sec memory
+    # consumption: 7 times as much as pypsa-eur. In reality,
+    # sector options play a role here.
+    return 7 * mem
 
 
-def near_opt_memory(wildcards):
-    return config["near_opt_approx"].get(
-        "num_parallel_solvers", 1
-    ) * optimisation_memory(wildcards)
+# When the cluster isn't busy, runtime isn't very important and we can just make
+# very generous estimates. Should be at least about a factor of 2-3.
+OPT_TIME_SLACK = 3
+
+
+def opt_time_exp(wildcards):
+    """Returns the expected runtime of a network optimisation in minutes."""
+    # Parse the network specs
+    s = parse_net_spec(wildcards.spec)
+
+    if s["clusters"].endswith("m"):
+        clusters = int(s["clusters"][:-1])
+    elif "-" in s["clusters"]:
+        clusters = sum(map(int, s["clusters"].split("-")))
+    else:
+        clusters = int(s["clusters"])
+
+    # Compute a multiplicative factor based on time resolution.
+    h = 1
+    opts = s["opts"] if "opts" in s else s["sector_opts"]
+
+    # First try to get time resolution from "xH" opt
+    for o in opts.split("-"):
+        m = re.match(r"^(\d+)h$", o, re.IGNORECASE)
+        if m is not None:
+            h = int(m.group(1))
+            break
+
+    # In case there's a time segmentation opt, it takes precedence
+    for o in opts.split("-"):
+        # Time series segmentation
+        m = re.match(r"^(\d+)seg$", o, re.IGNORECASE)
+        if m is not None:
+            h = 8760 / int(m.group(1))
+            break
+
+    # Some data points for estimation:
+    # - (3H, 35 nodes): 8136s average per optimisation
+    #   ~ 270s / node
+    # - (3H, 55 nodes): 14875s average per optimisation
+    #   ~ 232s / node
+
+    # Based on two data-points (average runtimes for 35 and 55
+    # node resolutions), we use a simple quadratic regression
+    # based on the number of nodes to estimate runtime. The
+    # following is in seconds:
+    quad_estimate = 500 * clusters + 5.7 * clusters * clusters
+    # Divide by time resolution and convert to minutes
+    return OPT_TIME_SLACK * quad_estimate / (60 * h)
 
 
 rule compute_optimum:
     input:
         network=os.path.join(networks_dir, "{spec}.nc"),
+    params:
+        overrides=override_dir,
     output:
         # Example: "optimum/1980-2020_181_90m_lcopt_Co2L-3H.nc"
         #                   <------------spec------------->
@@ -289,532 +458,280 @@ rule compute_optimum:
     conda:
         "envs/maa.fixed.yaml"
     resources:
-        mem_mb=optimisation_memory,
+        mem_mb=lambda wildcards, attempt: attempt * optimisation_memory(wildcards),
+        runtime=lambda wildcards, attempt: min(
+            MAX_RUNTIME, attempt * 4 * opt_time_exp(wildcards)
+        ),
+    retries: 3
     threads: grb_threads
+    shadow:
+        "copy-minimal"
     script:
         "scripts/compute_optimum.py"
 
 
 def calc_obj_bound_input(w):
+    scenarios = scenario_collections[w.scenarios_hash]
     return [
-        os.path.join(results_dir, f"optimum/{y}_{w.spec}.obj")
-        for y in parse_year_wildcard(w.year)
+        os.path.join(
+            results_dir,
+            f"optimum/{scenario}.obj",
+        )
+        for scenario in scenarios
     ]
 
 
+# Local rule:
 rule calc_obj_bound:
     input:
         calc_obj_bound_input,
     output:
-        # Example: "obj_bound/181_90m_lcopt_Co2L-3H_e0.15uni1980-2020"
-        #                     <-------spec-------->  epsf   <-year-->
-        os.path.join(results_dir, "obj_bound/{spec}_e{epsf}uni{year}"),
+        # Example: "obj_bound/e0.05uni_ad80987f"
+        #                      epsf    <-hash->
+        # Note the use of "epsf", restricted to a floating point
+        # number. The "uni" part is _fixed_ in the output filename for
+        # this rule, so the {eps} wildcard must end on "uni".
+        os.path.join(results_dir, "obj_bound/e{epsf}uni_{scenarios_hash}"),
     resources:
         mem_mb=10,
     script:
         "scripts/calc_obj_bound.py"
 
 
-def obj_bound_input(w):
-    # Depending on the type of epsilon specification, we either give a
-    # "uniform" objective bound (which will be the same for all years)
-    # or just the objective value.
-    if "uni" in w.eps:
-        return os.path.join(results_dir, f"obj_bound/{w.spec}_e{w.eps}")
-    else:
-        return os.path.join(results_dir, f"obj_bound/{w.spec}_e{w.eps}uni{w.year}")
+def near_opt_memory(wildcards):
+    return config["near_opt_approx"].get(
+        "num_parallel_solvers", 1
+    ) * optimisation_memory(wildcards)
+
+
+def mga_runtime(wildcards):
+    """Upper bound on MGA runtime in minutes."""
+    num_parallel = int(config["near_opt_approx"].get("num_parallel_solvers", 1))
+    num_opts = 2 * len(config["projection"])
+    # Give a generous amount of slack in case of single optimisations
+    # that take a long time.
+    return 4 * math.ceil(num_opts / num_parallel) * opt_time_exp(wildcards)
 
 
 rule mga:
     input:
-        network=os.path.join(networks_dir, "{year}_{spec}.nc"),
-        optimum=os.path.join(results_dir, "optimum/{year}_{spec}.csv"),
-        obj_bound=obj_bound_input,
+        network=os.path.join(networks_dir, "{name}{spec}.nc"),
+        optimum=os.path.join(results_dir, "optimum/{name}{spec}.csv"),
+        obj_bound=os.path.join(results_dir, "obj_bound/e{eps}_{scenarios_hash}"),
+    params:
+        overrides=override_dir,
     output:
         # Example: "mga/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.csv"
         #               <-year--> <------spec--------->  <-----eps----->
-        mga_space=os.path.join(results_dir, "mga/{year}_{spec}_e{eps}.csv"),
+        mga_space=os.path.join(
+            results_dir, "mga/{name}{spec}_e{eps}_{scenarios_hash}.csv"
+        ),
     log:
-        os.path.join("logs", run_name, "mga/{year}_{spec}_e{eps}.log"),
-        debug=directory(os.path.join("debug", run_name, "mga/{year}_{spec}_e{eps}")),
+        os.path.join("logs", run_name, "mga/{name}{spec}_e{eps}_{scenarios_hash}.log"),
+        debug=directory(
+            os.path.join("debug", run_name, "mga/{name}{spec}_e{eps}_{scenarios_hash}")
+        ),
     conda:
         "envs/maa.fixed.yaml"
     resources:
-        mem_mb=near_opt_memory,
+        mem_mb=near_opt_memory,  # TODO: this isn't accurate when number of parallel processes is greater than mga optimisations.
+        runtime=lambda wildcards, attempt: min(
+            MAX_RUNTIME, attempt * mga_runtime(wildcards)
+        ),
+        disk_mb=2 * len(config["projection"]) * 2000,
+    retries: 3
     # Make snakemake prioritise finishing these runs before compute_near_opt
     priority: 10
     threads: parallel_threads
+    shadow:
+        "copy-minimal"
     script:
         "scripts/mga.py"
 
 
+def near_opt_runtime(wildcards):
+    """Upper bound on near-opt approx runtime in minutes."""
+    num_parallel = int(config["near_opt_approx"].get("num_parallel_solvers", 1))
+    num_opts = int(config["near_opt_approx"]["iterations"])
+    # Give some slack (factor of 1.2) just in case.
+    return 1.2 * (num_opts / num_parallel) * opt_time_exp(wildcards)
+
+
 rule compute_near_opt:
     input:
-        network=os.path.join(networks_dir, "{year}_{spec}.nc"),
-        mga_space=os.path.join(results_dir, "mga/{year}_{spec}_e{eps}.csv"),
-        obj_bound=obj_bound_input,
+        network=os.path.join(networks_dir, "{name}{spec}.nc"),
+        mga_space=os.path.join(
+            results_dir, "mga/{name}{spec}_e{eps}_{scenarios_hash}.csv"
+        ),
+        obj_bound=os.path.join(results_dir, "obj_bound/e{eps}_{scenarios_hash}"),
+    params:
+        overrides=override_dir,
+        iterations=os.path.join(
+            debug_dir,
+            "near_opt/{name}{spec}_e{eps}_{scenarios_hash}",
+        ),
+        cache=os.path.join(
+            cache_dir,
+            "near_opt/{name}{spec}_e{eps}_{scenarios_hash}",
+        ),
     output:
         # Example: "near_opt/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.csv"
         #                    <-year--> <------spec--------->  <-----eps----->
-        near_opt=os.path.join(results_dir, "near_opt/{year}_{spec}_e{eps}.csv"),
+        near_opt=os.path.join(
+            results_dir, "near_opt/{name}{spec}_e{eps}_{scenarios_hash}.csv"
+        ),
     log:
-        python=os.path.join("logs", run_name, "near_opt/{year}_{spec}_e{eps}.log"),
-        iterations=os.path.join("debug", run_name, "near_opt/{year}_{spec}_e{eps}"),
-        cache=os.path.join("cache", run_name, hash_run, "near_opt/{year}_{spec}_e{eps}"),
+        os.path.join(
+            "logs", run_name, "near_opt/{name}{spec}_e{eps}_{scenarios_hash}.log"
+        ),
     benchmark:
-        os.path.join("benchmarks", run_name, "near_opt/{year}_{spec}_e{eps}.tsv")
+        os.path.join(
+            "benchmarks", run_name, "near_opt/{name}{spec}_e{eps}_{scenarios_hash}.tsv"
+        )
     conda:
         "envs/maa.fixed.yaml"
     resources:
         mem_mb=near_opt_memory,
+        disk_mb=config["near_opt_approx"]["iterations"] * 2000,
+        runtime=lambda wildcards, attempt: min(
+            MAX_RUNTIME, attempt * near_opt_runtime(wildcards)
+        ),
+    retries: 3
     threads: parallel_threads
+    shadow:
+        "copy-minimal"
     script:
         "scripts/compute_near_opt.py"
 
 
-def intersection_input_networks(w):
+def intersection_hulls(w):
     """Return the list of near-optimal spaces needed for an intersection."""
-    years = parse_year_wildcard(w.year)
-    # Format and return the list of file names.
+    # Build a list of network names from the intersection_scenarios
+    # section of the config.
+    scenarios = scenario_collections[w.scenarios_hash]
     return [
         os.path.join(
             results_dir,
-            f"near_opt/{y}_{w.spec}.csv",
+            f"near_opt/{scenario}_e{w.eps}_{w.scenarios_hash}.csv",
         )
-        for y in years
+        for scenario in scenarios
     ]
+
+
+pre_cluster_config = config["near_opt_approx"].get("intersection_pre_cluster", {})
 
 
 rule compute_intersection:
     input:
-        hulls=intersection_input_networks,
+        hulls=intersection_hulls,
+    params:
+        pre_cluster_enabled=pre_cluster_config.get("enabled", False),
+        pre_cluster_n_clusters=pre_cluster_config.get("n_clusters", 5000),
     output:
         # Example: "intersection/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.csv"
         #                        <-year--> <---------------spec----------------->
-        intersection=os.path.join(results_dir, "intersection/{year}_{spec}.csv"),
-        centre=os.path.join(results_dir, "intersection/centre_{year}_{spec}.csv"),
-        radius=os.path.join(results_dir, "intersection/radius_{year}_{spec}"),
+        intersection=os.path.join(
+            results_dir, "intersection/intersection_e{eps}_{scenarios_hash}.csv"
+        ),
+        centre=os.path.join(
+            results_dir, "intersection/centre_e{eps}_{scenarios_hash}.csv"
+        ),
+        radius=os.path.join(results_dir, "intersection/radius_e{eps}_{scenarios_hash}"),
     log:
-        os.path.join("logs", run_name, "intersection/{year}_{spec}.log"),
+        os.path.join(
+            "logs", run_name, "intersection/intersection_e{eps}_{scenarios_hash}.log"
+        ),
     conda:
         "envs/maa.fixed.yaml"
     resources:
-        mem_mb=1000,
+        mem_mb=30000,
+        runtime=1200,  # In minutes    
     script:
         "scripts/intersect_near_optimal.py"
 
 
-# Rule to compute exact robust resolution, with total capacities given
-# by some centre.
-rule compute_robust_exact:
-    input:
-        network=os.path.join(networks_dir, "{year}_{spec}.nc"),
-        centre=os.path.join(
-            results_dir, "intersection/centre_{intersectionyears}_{spec}_e{eps}.csv"
-        ),
-    output:
-        # Example: "robust/exact/1980-2020_1989_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.nc"
-        #                        <-inter-> year <------spec--------->  <-----eps----->
-        network=os.path.join(
-            results_dir, "robust/exact/{intersectionyears}_{year}_{spec}_e{eps}.nc"
-        ),
-        operated_network=os.path.join(
-            results_dir,
-            "operations/robust/exact/{intersectionyears}_{year}_{spec}_e{eps}.nc",
-        ),
-        obj=os.path.join(
-            results_dir, "robust/exact/{intersectionyears}_{year}_{spec}_e{eps}.obj"
-        ),
-    log:
-        os.path.join(
-            "logs",
-            run_name,
-            "robust/exact/{intersectionyears}_{year}_{spec}_e{eps}.log",
-        ),
-    benchmark:
-        os.path.join(
-            "benchmarks",
-            run_name,
-            "robust/exact/{intersectionyears}_{year}_{spec}_e{eps}.tsv",
-        )
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=optimisation_memory,
-    threads: grb_threads
-    script:
-        "scripts/compute_robust_exact.py"
+if "robust_networks" in config:
 
-
-# The following rule is for the special case of an exact robust
-# network operated over the same set of years as for which the
-# intersection is computed.
-rule compute_robust_exact_simple:
-    input:
-        os.path.join(results_dir, "robust/exact/{year}_{year}_{spec}_e{eps}.nc"),
-    output:
-        os.path.join(results_dir, "robust/exact/{year}_{spec}_e{eps}.nc"),
-    shell:
-        "cp {input} {output}"
-
-
-ruleorder: compute_robust_exact > compute_robust_exact_simple
-
-
-# Rule to compute heuristic robust allocation, with total capacities
-# given by some centre. As opposed to solving the network over the
-# full specified year range (with fixed given technology investment
-# bounds), this method computes exact robust solutions for the
-# individual given years, and combines these solutions heuristically.
-
-
-rule compute_robust_mean:
-    input:
-        network=os.path.join(networks_dir, "{intersectionyears}_{spec}.nc"),
-        centre=os.path.join(
-            results_dir, "intersection/centre_{intersectionyears}_{spec}_e{eps}.csv"
-        ),
-        # Collect all exact robust allocations for the single years in
-        # the period over which we compute a mean allocation
-        # ({intersectionyears}). Note that the single-year exact
-        # robust allocations are optimised over a single year ({y})
-        # but have coordinates corresponding to the centre point of
-        # the intersection of all near-optimal spaces in
-        # {intersectionyears}.
-        exact_robusts=lambda w: [
+    rule compute_robust_networks:
+        input:
+            network=os.path.join(networks_dir, "{spec}.nc"),
+            intersection=os.path.join(
+                results_dir, "intersection", "intersection_e{eps}_{scenarios_hash}.csv"
+            ),
+            centre=os.path.join(
+                results_dir, "intersection", "centre_e{eps}_{scenarios_hash}.csv"
+            ),
+        params:
+            overrides=override_dir,
+            num_robust=config["robust_networks"]["num_robust"],
+            num_parallel=config["robust_networks"]["num_parallel"],
+            dim_groups=config["robust_networks"].get("dim_groups", []),
+            networks_dir=os.path.abspath(
+                os.path.join(
+                    results_dir, "robust_networks", "{spec}_e{eps}_{scenarios_hash}"
+                )
+            ),
+        output:
             os.path.join(
                 results_dir,
-                f"robust/exact/{w.intersectionyears}_{y}_{w.spec}_e{w.eps}.nc",
-            )
-            for y in parse_year_wildcard(w.intersectionyears)
-        ],
-    output:
-        # Example: "robust/mean/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.nc"
-        #                       <-inter-> <-------spec-------->  <-----eps----->
-        network=os.path.join(
-            results_dir, "robust/mean/{intersectionyears}_{spec}_e{eps}.nc"
-        ),
-    log:
-        os.path.join(
-            "logs", run_name, "robust/mean/{intersectionyears}_{spec}_e{eps}.log"
-        ),
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=1000,
-    threads: 1
-    script:
-        "scripts/compute_robust_mean.py"
+                "robust_networks",
+                "{spec}_e{eps}_{scenarios_hash}",
+                "flag.done",
+            ),
+        log:
+            os.path.join(
+                "logs",
+                run_name,
+                "robust_networks",
+                "{spec}_e{eps}_{scenarios_hash}.log",
+            ),
+        conda:
+            "envs/robust-networks.yaml"
+        resources:
+            mem_mb=(
+                lambda wildcards: config["robust_networks"]["num_parallel"]
+                * optimisation_memory(wildcards)
+            ),
+            runtime=(
+                lambda wildcards, attempt: min(
+                    MAX_RUNTIME,
+                    5
+                    * attempt
+                    * config["robust_networks"]["num_robust"]
+                    * opt_time_exp(wildcards)
+                    / config["robust_networks"]["num_parallel"],
+                )
+            ),
+        retries: 3
+        threads: grb_threads * config["robust_networks"]["num_parallel"]
+        shadow:
+            "copy-minimal"
+        script:
+            "scripts/compute_robust_networks.py"
 
-
-# Calculate the most expensive year and the investment costs of it, so
-# that we can use it for the conservative and naive heuristic later.
-rule calc_most_expensive_year:
-    input:
-        lambda w: [
-            os.path.join(results_dir, f"optimum/{y}_{w.spec}.nc")
-            for y in parse_year_wildcard(w.year)
-        ],
-    output:
-        # Example: "networks/most-expensive_1980-2020_181_90m_lcopt_Co2L-3H.nc"
-        #                                   <-year--> <-------spec-------->
-        most_expensive_network=os.path.join(
-            results_dir, "networks/most-expensive_{year}_{spec}.nc"
-        ),
-        investment_cost=os.path.join(
-            results_dir, "networks/most-expensive_{year}_{spec}_investment"
-        ),
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=1000,
-    threads: 1
-    script:
-        "scripts/calc_most_expensive_year.py"
-
-
-rule compute_robust_naive:
-    input:
-        network=os.path.join(networks_dir, "{spec}.nc"),
-        most_expensive_network=os.path.join(
-            results_dir, "networks/most-expensive_{spec}.nc"
-        ),
-        robust_exact=os.path.join(results_dir, "robust/exact/{spec}_e{eps}.nc"),
-    output:
-        # Example: "robust/naive/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.nc"
-        #                        <-------------spec------------>  <-----eps----->
-        network=os.path.join(results_dir, "robust/naive/{spec}_e{eps}.nc"),
-    log:
-        os.path.join("logs", run_name, "robust/naive/{spec}_e{eps}.csv"),
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=100,
-    threads: 1
-    script:
-        "scripts/compute_robust_naive.py"
-
-
-def robust_conservative_memory(wildcards):
-    """Compute memory requirements for the following rule.
-
-    The requirements are the same as computed in
-    `optimisation_memory`, except just over a single year.
-    """
-    # We need to modify the year wildcard to be just a single year in
-    # order to get the correct memory calculation, since the
-    # conservative robust network is indeed computed by an
-    # optimisation with a single weather year.
-    w = copy.deepcopy(wildcards)
-    w.year = "0"
-    return optimisation_memory(w)
-
-
-rule compute_robust_conservative:
-    input:
-        network=os.path.join(networks_dir, "{year}_{spec}.nc"),
-        most_expensive_network=os.path.join(
-            results_dir, "networks/most-expensive_{year}_{spec}.nc"
-        ),
-        centre=os.path.join(results_dir, "intersection/centre_{year}_{spec}_e{eps}.csv"),
-    output:
-        # Example: "robust/conservative/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.nc"
-        #                               <-year--> <-------spec-------->  <-----eps----->
-        network=os.path.join(results_dir, "robust/conservative/{year}_{spec}_e{eps}.nc"),
-    log:
-        os.path.join("logs", run_name, "robust/conservative/{year}_{spec}_e{eps}.csv"),
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=robust_conservative_memory,
-    threads: grb_threads
-    script:
-        "scripts/compute_robust_conservative.py"
-
-
-def operations_memory(wildcards, attempt):
-    """Estimate the memory requirements for solving operations.
-
-    The wildcards are used to extract temporal and spatial resolution.
-    At first half the memory estimated by `optimsation_memory` is
-    used, and this is increased in successive attempts if snakemake is
-    run with the `--restart-times n` argument.
-
-    """
-    return attempt * 0.8 * optimisation_memory(wildcards)
-
-
-# Rule to solve operations of network with given capacities.
-rule solve_operations:
-    input:
-        network=os.path.join(results_dir, "{spec}.nc"),
-    output:
-        # Example: "operations-single-years/robust/mean/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.nc"
-        #                     <---op_m----> <----------------------------spec-------------------------->
-        network=os.path.join(results_dir, "operations{operation_method}/{spec}.nc"),
-    log:
-        os.path.join("logs", run_name, "operations{operation_method}/{spec}.log"),
-    benchmark:
-        os.path.join("benchmarks", run_name, "operations{operation_method}/{spec}.tsv")
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=operations_memory,
-    threads: grb_threads
-    script:
-        "scripts/solve_operations.py"
-
-
-# Rule to solve operations of network with given capacities, and a
-# fixed budget for operational costs. This rule can at the moment only
-# be used for solving the operations of different robust allocations,
-# since the operational budget itself comes from the operational costs
-# of the exact robust allocation. Note that we use the same script is
-# the above operations rule, but indicate to it that we want to
-# operate with a budget by using a parameter as a flag.
-
-
-rule solve_operations_with_budget:
-    input:
-        network=os.path.join(results_dir, "robust/{method}/{spec}.nc"),
-        op_bound_network=os.path.join(results_dir, "operations/robust/exact/{spec}.nc"),
-    output:
-        # Example: "operations-single-years_B/robust/mean/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.nc"
-        #                     <---op_m---->          --m- <---------------------spec--------------------->
-        network=os.path.join(
-            results_dir, "operations{operation_method}_B/robust/{method}/{spec}.nc"
-        ),
-    log:
-        os.path.join(
-            "logs",
-            run_name,
-            "operations{operation_method}_B/robust/{method}/{spec}.log",
-        ),
-    benchmark:
-        os.path.join(
-            "benchmarks",
-            run_name,
-            "operations{operation_method}_B/robust/{method}/{spec}.tsv",
+    robust_base = next(
+        filter(
+            lambda s: s.startswith(config["robust_networks"]["robust_base"]),
+            intersection_scenarios,
         )
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=operations_memory,
-    threads: grb_threads
-    script:
-        "scripts/solve_operations.py"
-
-
-# Some additional rules are needed for the "operation" of exact robust
-# networks. In fact, those networks are already operated when they are
-# generated (see the `compute_robust_exact` rule and script), so we
-# get the operations "for free" and just have to copy the network
-# files to the correct locations.
-
-
-rule copy_robust_exact_operations:
-    # This input comes directly from the output of the `compute_robust_exact` rule.
-    input:
-        os.path.join(results_dir, "operations/robust/exact/{year}_{spec}_e{eps}.nc"),
-    # We provide the operated network both as if it was operated with
-    # or without a budget: since it is the exact robust network this
-    # does not make a difference.
-    output:
-        os.path.join(
-            results_dir, "operations{with_budget}/robust/exact/{year}_{spec}_e{eps}.nc"
-        ),
-    shell:
-        "cp {input} {output}"
-
-
-ruleorder: compute_robust_exact > solve_operations
-ruleorder: copy_robust_exact_operations > solve_operations
-ruleorder: copy_robust_exact_operations > solve_operations_with_budget
-
-
-# Rule to prepare a directory of network files which are to be solved
-# in operations mode for validation. Since the exact number of naming
-# of the network files in the output directory may vary depending on
-# the configuration, this rule is a _checkpoint_, which means that the
-# snakemake rule DAG is re-computed after this rule has run. At that
-# point, snakemake finds our which networks (in the output directory)
-# to solve in operations mode for the validation summary.
-
-
-checkpoint prepare_validation:
-    input:
-        network=os.path.join(results_dir, "robust/{method}/{spec}.nc"),
-        intersection=os.path.join(results_dir, "intersection/{spec}.csv"),
-        centre=os.path.join(results_dir, "intersection/centre_{spec}.csv"),
-        radius=os.path.join(results_dir, "intersection/radius_{spec}"),
-    output:
-        # Example: "robust-validation/mean/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020/"
-        #                             -m-- <---------------------spec--------------------->
-        directory(os.path.join(results_dir, "robust-validation/{method}/{spec}")),
-    log:
-        os.path.join("logs", run_name, "robust-validation/{method}/{spec}.log"),
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=1000,
-    threads: 1
-    script:
-        "scripts/prepare_validation.py"
-
-
-# The following rule collects the operated versions of the validation
-# networks produced by the `prepare_validation`-rule/checkpoint, and
-# outputs some statistics about the operations. The input function for
-# the summary rule reads the names of all networks produced by
-# `prepare_validation` using the `glob_wildcards` function, and gives
-# the names of the corresponding operated networks.
-
-
-def summarise_validation_input(wildcards):
-    validation_networks = checkpoints.prepare_validation.get(**wildcards).output[0]
-    return expand(
-        os.path.join(
-            results_dir,
-            "operations{operation_method}/robust-validation/{method}/{spec}/{n}.nc",
-        ),
-        method=wildcards.method,
-        operation_method=wildcards.operation_method,
-        spec=wildcards.spec,
-        n=glob_wildcards(os.path.join(validation_networks, "{n}.nc")).n,
     )
 
-
-rule summarise_validation:
-    input:
-        summarise_validation_input,
-    output:
-        # Example: "robust-validation-summary-single-years/mean/1980-2020_181_90m_lcopt_Co2L-3H_e0.2uni1980-2020.csv"
-        #                                     <---op_m---> -m-- <--------------------spec---------------------->
-        summary=os.path.join(
-            results_dir,
-            "robust-validation-summary{operation_method}/{method}/{spec}.csv",
-        ),
-    log:
-        os.path.join(
-            "logs",
-            run_name,
-            "robust-validation-summary{operation_method}/{method}/{spec}.log",
-        ),
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=100,
-    threads: 1
-    script:
-        "scripts/summarise_feasibility.py"
-
-
-rule summarise_robust:
-    input:
-        [
-            os.path.join(
-                results_dir,
-                "operations{operation_method}{with_budget}/robust/" + m + "/{spec}.nc",
+    # Replace sector options according to config
+    if "opts_substitutions" in config["robust_networks"]:
+        for orig, replacement in config["robust_networks"][
+            "opts_substitutions"
+        ].items():
+            robust_base = re.sub(
+                orig, replacement, robust_base, flags=re.IGNORECASE
             )
-            for m in config["scenario"]["method"]
-        ],
-    output:
-        summary=os.path.join(
-            results_dir, "robust-summary{operation_method}{with_budget}/{spec}.csv"
-        ),
-    log:
-        os.path.join(
-            "logs",
-            run_name,
-            "robust-summary{operation_method}{with_budget}/{spec}.log",
-        ),
-    conda:
-        "envs/maa.fixed.yaml"
-    resources:
-        mem_mb=100,
-    threads: 1
-    script:
-        "scripts/summarise_feasibility.py"
 
-
-# Rule to just generate all pypsa-eur subworkflow networks.
-rule build_all_pypsa_eur:
-    input:
-        expand(
-            os.path.join(networks_dir, "{year}_{simpl}_{clusters}_l{ll}_{opts}.nc"),
-            **config["scenario"]
-        ),
-
-
-# Rule to invoke the pypsa-eur subworkflow and copy the result to a
-# separate directory.
-rule build_network:
-    input:
-        os.path.join(
-            pypsa_eur_run_dir,
-            "networks/elec_{year}_s{simpl}_{clusters}_ec_l{ll}_{opts}.nc",
-        ),
-    output:
-        os.path.join(networks_dir, "{year}_{simpl}_{clusters}_l{ll}_{opts}.nc"),
-    shell:
-        "cp {input} {output}"
+    rule compute_all_robust_networks:
+        input:
+            [
+                os.path.join(
+                    results_dir,
+                    f"robust_networks/{robust_base}_e{eps}_{int_sce_hash}",
+                    "flag.done",
+                )
+                for eps in config["intersection_scenarios"]["eps"]
+            ],

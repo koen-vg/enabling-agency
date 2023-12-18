@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2022 Koen van Greevenbroek & Aleksander Grochowicz
+# SPDX-FileCopyrightText: 2023 Koen van Greevenbroek & Aleksander Grochowicz
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -22,10 +22,18 @@ import numpy as np
 import scipy.linalg as linalg
 from gurobipy import GRB
 from scipy.spatial import ConvexHull, HalfspaceIntersection
-from scipy.stats.qmc import LatinHypercube
+from scipy.stats.qmc import Halton, LatinHypercube
+from sklearn.cluster import MiniBatchKMeans
 
 
-def intersection(hulls: Collection[ConvexHull], return_centre=False):
+def intersection(
+    hulls: Collection[ConvexHull],
+    qhull_options="Qt",
+    return_centre=False,
+    pre_cluster=False,
+    pre_cluster_n_clusters=5000,
+    return_hs=False,
+):
     """Compute an approximate intersection of a collection of convex hulls.
 
     This function returns the vertices of (an approximation of) the
@@ -43,12 +51,8 @@ def intersection(hulls: Collection[ConvexHull], return_centre=False):
     polytope with O(n^floor(d/2)) vertices. Given that the input
     convex hulls of this function may already have many facets, we
     cannot hope to compute all vertices of the intersection.
-    Therefore, we make qhull compute a reasonable approximation. This
-    is controlled by the C, A and W options for qhull, which merge
-    nearby vertices, adjacent facets at a close-to-0 degree angle and
-    vertices close to facets respectively. The thresholds for merging
-    are set such that the approximation is accurate up to about
-    1/100th of the maximum width of the intersection in any dimension.
+    Therefore, we make qhull compute a reasonable approximation,
+    obtained by merging appropriate facets.
 
     The intersection is returned as an array of vertices, one vertex
     per row. Optionally, the Chebyshev centre and radius of the
@@ -75,18 +79,9 @@ def intersection(hulls: Collection[ConvexHull], return_centre=False):
     # Gather the defining constraints of all the hulls.
     constraints = np.concatenate([h.equations for h in hulls])
 
-    # Now, the input hulls may be very large, meaning the last column
-    # of the `constraints` matrix may be very large. For the sake of
-    # numerical stability and controlling the fidelity of convex hull
-    # approximation, we scale this colunm down to a managable
-    # magnitude, effectively scaling the sizes of the input polytopes
-    # down uniformly.
-    b_range = max(constraints[:, -1]) - min(constraints[:, -1])
-    scaled_constraints = np.copy(constraints)
-    scaled_constraints[:, -1] = constraints[:, -1] / b_range
-
-    # Find an interior point, needed to compute the intersection.
-    c, radius, _ = ch_centre_from_constraints(scaled_constraints)
+    # Compute the centre and radius, needed to initialise the
+    # halfspace intersection.
+    c, radius, _ = ch_centre_from_constraints(constraints)
 
     # If such a point wasn't found, the intersection is empty (barring
     # numerical trouble in finding the point.)
@@ -97,32 +92,47 @@ def intersection(hulls: Collection[ConvexHull], return_centre=False):
         else:
             return None
 
-    # Compute the intersection (using qhull in the background). The
-    # option QJ "joggles" the input in order to circumvent precision
-    # problems, and the C, A and W options ensure that qhull only
-    # approximates the output, seeing as an exact answer may be too
-    # large (have too many points).
+    if pre_cluster:
+        # Use kmeans clustering to reduce the number of constraints.
+        logging.info(f"Pre-clustering constraints down to {pre_cluster_n_clusters} ...")
+        constraints = (
+            MiniBatchKMeans(
+                n_clusters=pre_cluster_n_clusters, random_state=0, n_init=1, max_iter=20
+            )
+            .fit(constraints)
+            .cluster_centers_
+        )
+
+    # Compute the intersection (using qhull in the background). We use
+    # the following qhull options:
+    # - QJ: "joggle" (move around slightly) input vertices in order to
+    #   resolve potential precision problems.
+    # - QbB: rescale input to the unit cube, making the following
+    #   approximation parameters scale-free.
+    # - W1e-3, C1e-3: post-merge very close facets (see qhull
+    #   documentation).
+    # - Q14: experimental feature allowing the merging of close
+    #   vertices in case of degenerate geometry.
     logging.info("Starting Qhull halfspace intersection...")
     t_start = time.time()
-    hs = HalfspaceIntersection(scaled_constraints, c, qhull_options="QJ C0.001")
+    hs = HalfspaceIntersection(constraints, c, qhull_options=qhull_options)
     t_stop = time.time()
     logging.info(f"Halfspace intersection took {t_stop - t_start:.2f} seconds.")
 
     # Extract the vertices of the intersection. Confusingly those
     # vertices are called "intersections" themselves, meaning
     # intersections of the given halfspaces (constraints).
-    scaled_vertices = hs.intersections
+    vertices = hs.intersections
 
-    # Scale everything back.
-    vertices = b_range * scaled_vertices
-    c = b_range * c
-    radius = b_range * radius
-
-    # Return the vertices.
-    if return_centre:
-        return vertices, c, radius
+    # Returns the halfspace
+    if return_hs:
+        return hs
     else:
-        return vertices
+        # Return the vertices.
+        if return_centre:
+            return vertices, c, radius
+        else:
+            return vertices
 
 
 def ch_centre(hull: ConvexHull) -> (np.array, float, np.array):
@@ -229,7 +239,7 @@ def ch_centre_from_constraints(constraints: np.array) -> (np.array, float, np.ar
     # Prepare variable lower bounds: we want coordinates to be
     # unbounded and the radius to be nonnegative. The upper bounds
     # are positive infinity by default, so we do not need to set them.
-    lb = [[-GRB.INFINITY] * dims + [0]]
+    lb = [-GRB.INFINITY] * dims + [0]
 
     # Solve the linear program.
     m = gp.Model()
@@ -260,6 +270,165 @@ def ch_centre_from_constraints(constraints: np.array) -> (np.array, float, np.ar
 
     # Return the results.
     return (centre, radius, tight_constraints)
+
+
+def slice_hull(
+    hull: ConvexHull,
+    slice_dim: int,
+    slice_val: float,
+    qhull_options="QJ C1e-1 W1e-1 Q14",
+) -> np.array:
+    """Slice a convex hull along a given dimension.
+
+    This function slices a convex hull along a given dimension, i.e.
+    it returns the convex hull of the points which are in the given
+    convex hull and have a given value in the given dimension.
+
+    Parameters
+    ----------
+    hull : scipy.spatial.ConvexHull
+    slice_dim : int
+    slice_val : float
+
+    Returns
+    -------
+    np.array of shape (_, dims)
+
+    """
+    # To compute the slice, we intersect each facet of the convex hull
+    # with the hyperplane defined by "slice_dim = slice_val". This is
+    # done by substituting the latter equation into the equation
+    # defining each facet. Each of these intersections forms a
+    # hyperplane in (d-1)-dimensional space, where d is the dimension
+    # of the original convex hull. We then compute the halfplane
+    # intersection of these resulting hyperplanes, which is the slice
+    # we are looking for.
+
+    # When working with the facets defining the convex hull, recall
+    # that they are recorded in `hull.equations`; an array with shape
+    # (nfacets, d+1) where the first d columns are the normal vector
+    # of the facet and the last column is the offset of the facet. In
+    # particular, the normal vector n and constant b define a
+    # hyperplane by the equation nx + b = 0.
+
+    # First, filter out facets which don't intersect the slicing
+    # hyperplane.
+
+    equations = [
+        eq
+        for (eq, facet) in zip(hull.equations, hull.simplices)
+        if (
+            min(hull.points[facet, slice_dim])
+            <= slice_val
+            <= max(hull.points[facet, slice_dim])
+        )
+    ]
+
+    if len(equations) == 0:
+        return None
+
+    # Now intersect each of the remaining facets with the slicing
+    # hyperplane.
+    slice_planes = np.vstack(
+        [
+            np.hstack(
+                [
+                    f[:slice_dim],
+                    f[slice_dim + 1 : -1],
+                    [f[-1] + slice_val * f[slice_dim]],
+                ]
+            )
+            for f in equations
+        ]
+    )
+
+    # Scale the slice planes; making approximation more robust.
+    b_range = max(slice_planes[:, -1]) - min(slice_planes[:, -1])
+    scaled_slice_planes = np.copy(slice_planes)
+    scaled_slice_planes[:, -1] = scaled_slice_planes[:, -1] / b_range
+
+    # In order to compute the halfspace intersection, we first need an
+    # interior point.
+    c, _, _ = ch_centre_from_constraints(scaled_slice_planes)
+
+    if c is None:
+        return None
+
+    # Compute the halfplane intersection of the slice planes.
+    try:
+        slice = HalfspaceIntersection(
+            scaled_slice_planes, c, qhull_options=qhull_options
+        )
+    except Exception:
+        print("Qhull error")
+        return None
+
+    # The vertices of the slice are (somewhat confusingly) named
+    # "intersections"; return them.
+    return b_range * slice.intersections
+
+
+def slice_dual(eqs: np.array, slice_dim: int, slice_val: float) -> np.array:
+    """Slice a convex hull, given in dual form, along a given dimension.
+
+    This function slices a convex hull along a given dimension, i.e.
+    it returns the convex hull of the points which are in the given
+    convex hull and have a given value in the given dimension.
+
+    The convex hull is given in dual form, that is, as a set of
+    equations. The equations are given as a matrix with shape (n,
+    d+1), where the first d columns are the normal vector of the facet
+    and the last column is the offset of the facet. In particular, the
+    normal vector n and constant b define a hyperplane by the equation
+    nx + b = 0.
+
+    Parameters
+    ----------
+    eqs : np.array of shape (n, d+1)
+    slice_dim : int
+    slice_val : float
+
+    Returns
+    -------
+    np.array of shape (_, dims)
+
+    """
+    # To compute the slice, we intersect each facet of the convex hull
+    # with the hyperplane defined by "slice_dim = slice_val". This is
+    # done by substituting the latter equation into the equation
+    # defining each facet. Each of these intersections forms a
+    # hyperplane in (d-1)-dimensional space, where d is the dimension
+    # of the original convex hull. We then compute the halfplane
+    # intersection of these resulting hyperplanes, which is the slice
+    # we are looking for.
+    slice_planes = np.hstack(
+        [
+            eqs[:, :slice_dim],
+            eqs[:, slice_dim + 1 : -1],
+            # The reshape trick is necessary to make the column vector 2D.
+            (eqs[:, -1] + slice_val * eqs[:, slice_dim]).reshape(-1, 1),
+        ],
+    )
+
+    # Scale the slice planes; making approximation more robust.
+    b_range = max(slice_planes[:, -1]) - min(slice_planes[:, -1])
+    scaled_slice_planes = np.copy(slice_planes)
+    scaled_slice_planes[:, -1] = scaled_slice_planes[:, -1] / b_range
+
+    # In order to compute the halfspace intersection, we first need an
+    # interior point.
+    c, _, _ = ch_centre_from_constraints(scaled_slice_planes)
+    if c is None:
+        return None
+
+    # Compute the halfplane intersection of the slice planes.
+    slice = HalfspaceIntersection(
+        scaled_slice_planes, c, qhull_options="QJ C5e-2 W5e-2 Q14"
+    )
+
+    # The vertices of the slice are (somewhat confusingly) named
+    # "intersections"; return them.
+    return b_range * slice.intersections
 
 
 def contains(hull: ConvexHull, point: np.array) -> bool:
@@ -378,6 +547,21 @@ def uniform_random_hypersphere_sampler(n: int):
     while True:
         # Transform from unit cube to cube around origin.
         p = 2 * np.random.random_sample((n,)) - 1
+        if np.linalg.norm(p) <= 1:
+            # Transform to lie on the unit hypersphere.
+            yield p / np.linalg.norm(p)
+
+
+def low_discrepancy_hypersphere_sampler(n: int):
+    """Generate points on the `n`-dimensional hypersphere at random.
+
+    The points are normalised and following the uniform distribution
+    on the hypersphere.
+    """
+    halton_sampler = Halton(n)
+    while True:
+        # Transform from unit cube to cube around origin.
+        p = 2 * halton_sampler.random(1) - 1
         if np.linalg.norm(p) <= 1:
             # Transform to lie on the unit hypersphere.
             yield p / np.linalg.norm(p)
@@ -521,7 +705,9 @@ def filter_vectors_auto(
     if initial_vectors is not None:
         previous_vecs = initial_vectors[:]
     else:
-        previous_vecs = []
+        vec = next(vecs)
+        previous_vecs = [vec]
+        yield vec
 
     num_retries = 0
     for vec in vecs:

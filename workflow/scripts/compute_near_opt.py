@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2022 Koen van Greevenbroek & Aleksander Grochowicz
+# SPDX-FileCopyrightText: 2023 Koen van Greevenbroek & Aleksander Grochowicz
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -13,15 +13,15 @@ import copy
 import logging
 import multiprocessing
 import os
+import threading
 import time
+import warnings
 from collections import OrderedDict
 from multiprocessing import Manager, Queue, get_context
 from pathlib import Path
-from typing import Collection, List
+from typing import Collection, Generic, List, TypeVar
 
 import numpy as np
-import pandas as pd
-import pypsa
 from _helpers import configure_logging
 from geometry import (
     ch_centre,
@@ -32,7 +32,35 @@ from geometry import (
     uniform_random_hypersphere_sampler,
 )
 from scipy.spatial import ConvexHull
-from utilities import get_basis_values, solve_network_in_direction
+from utilities import (
+    get_basis_values,
+    override_component_attrs,
+    solve_network_in_direction,
+)
+from workflow_utilities import parse_net_spec
+
+# Ignore futurewarnings raised by pandas from inside pypsa, at least
+# until the warning is fixed. This needs to be done _before_ pypsa and
+# pandas are imported; ignore the warning this generates.
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+import pandas as pd  # noqa: E402
+import pypsa  # noqa: E402
+
+T = TypeVar("T")
+
+
+class Wrapper(Generic[T]):
+    """Simple single-element wrapper class for convex hulls.
+
+    This is needed in order to pass convex hull objects to direction
+    generators, and update those convex hulls from outside the
+    generators in between generation passes. In this case, we keep the
+    convex hull in question in this wrapper and pass the wrapper to
+    the direction generator."""
+
+    def __init__(self, hull: T) -> None:
+        self.hull = hull
 
 
 def compute_near_opt(
@@ -163,7 +191,10 @@ def compute_near_opt(
     # of the corresponding probed directions (below).
     points: pd.DataFrame = mga_space
 
-    # Initialise the probed_directions with the directions used for MGA.
+    # Initialise the probed_directions with the directions used for MGA. Note:
+    # this list of probed directions is used in the direction generation
+    # algorithm for filtering purposes, and the directions are relative to the
+    # scaled space in which directions are generated (see below).
     probed_directions: List[np.array]
     probed_directions = list(np.eye(len(basis))) + list(-np.eye(len(basis)))
 
@@ -185,6 +216,9 @@ def compute_near_opt(
         logging.info(f"Found {num_iters} previous iterations.")
         points = previous_points
         probed_directions = previous_directions
+
+    # Additionally reuse previous debug data if found.
+    if previous_iteration_data is not None:
         iteration_data = previous_iteration_data
 
     # Using the MGA runs, we have already computed the possible ranges
@@ -201,15 +235,15 @@ def compute_near_opt(
     if not (scaling_ranges > 1.0).all():
         raise RuntimeError("After MGA, the near-optimal space is degenerate.")
     scaled_points = points / scaling_ranges
-    scaled_hull = ConvexHull(
-        scaled_points.to_numpy(), incremental=True, qhull_options=qhull_options
+    scaled_hull = Wrapper(
+        ConvexHull(scaled_points.to_numpy(), qhull_options=qhull_options)
     )
 
-    # If no previous iterations were found, initialise the first row
-    # of the `iteration_data` DataFrame.
-    if num_iters == 0:
-        centre, radius, _ = ch_centre(scaled_hull)
-        iteration_data.loc[-1] = np.hstack((centre, radius, scaled_hull.volume))
+    # If no previous debug iteration data was found, initialise the
+    # first row of the `iteration_data` DataFrame.
+    if len(iteration_data) == 0:
+        centre, radius, _ = ch_centre(scaled_hull.hull)
+        iteration_data.loc[-1] = np.hstack((centre, radius, scaled_hull.hull.volume))
 
     # Prepare the generator of directions to probe.
     if direction_method == "random-uniform":
@@ -248,7 +282,18 @@ def compute_near_opt(
         # Directions are first picked by "maximal-centre", then
         # "facets".
         dir_gen = maximal_centre_then_facets(
-            scaled_hull, probed_directions, direction_angle_sep
+            scaled_hull,
+            probed_directions,
+            direction_angle_sep,
+        )
+    elif direction_method == "maximal-centre-then-facets-then-random":
+        # Directions are first picked by "maximal-centre", then
+        # "facets".
+        dir_gen = maximal_centre_then_facets_then_random(
+            scaled_hull,
+            probed_directions,
+            len(basis),
+            direction_angle_sep,
         )
     else:
         raise ValueError("No mode of choosing directions defined.")
@@ -256,6 +301,7 @@ def compute_near_opt(
     # Set up a queue that can be shared among different processes.
     manager = Manager()
     queue = manager.Queue()
+    write_lock = manager.Lock()
     results = []
 
     # Start a pool of worker processes. Set the child process start
@@ -264,16 +310,20 @@ def compute_near_opt(
     # supported by all platforms.
     with get_context("spawn").Pool(num_parallel_solvers) as pool:
         # Generate initial directions, and start solving in those directions.
-        directions = []
+        scaled_directions = []
         for i in range(num_parallel_solvers):
             try:
                 d = next(dir_gen)
                 if d is not None:
-                    directions.append(d)
+                    # Append to the initial probing directions.
+                    scaled_directions.append(d)
+                    # Also append to the list of probed directions. (This must
+                    # be done before the next direction is generated, otherwise
+                    # it won't get filtered out.)
                     probed_directions.append(d)
                 else:
                     logging.warning(
-                        f"Could only generate {len(directions)} directions for"
+                        f"Could only generate {len(scaled_directions)} directions for"
                         f" {num_parallel_solvers} workers. Will try to generate more"
                         " after first iteration."
                     )
@@ -281,17 +331,32 @@ def compute_near_opt(
             except StopIteration:
                 logging.warning(
                     "Ran out of directions to probe! Could only generate"
-                    f" {len(directions)} directions for {num_parallel_solvers} parallel"
-                    " solvers."
+                    f" {len(scaled_directions)} directions for {num_parallel_solvers}"
+                    " parallel solvers."
                 )
                 break
+        # Note that the direction we computed are based on the scaled hull. We
+        # need to divide by the scaling ranges to transform back to the
+        # "unscaled" hull over which the optimisations take place.
+        directions = [
+            (sd / scaling_ranges.values) / np.linalg.norm(sd / scaling_ranges.values)
+            for sd in scaled_directions
+        ]
         for d in directions:
-            args = (queue, m, d, basis, obj_bound)
-            results.append(pool.apply_async(solve_worker, args))
+            args = (
+                queue,
+                m,
+                d,
+                basis,
+                obj_bound,
+                write_lock,
+                debug_dir,
+            )
+            results.append(pool.apply_async(solve_worker, args, error_callback=print))
 
         # Process solver results as they are put into the queue.
         while True:
-            p = queue.get()
+            p, n_opt_name = queue.get()
             if p is None:
                 # In this case the last optimisation was unsuccessful;
                 # this can happen sporadically due to, for example,
@@ -305,38 +370,62 @@ def compute_near_opt(
                 logging.info(f"Finished iteration {num_iters}.")
                 num_iters += 1
 
-                # Scale the values for easier computations of the convex hull
-                # and proportions.
-                sp = list(p.values()) / scaling_ranges
-
-                # Add the point to the convex hull.
-                scaled_hull.add_points([sp])
-
-                # Compute new Chebyshev centre and radius. Include a sanity
-                # check that the radius does not decrease!
-                centre, radius, _ = ch_centre(scaled_hull)
-                old_radius = iteration_data.radius.iloc[-1]
-                if (old_radius - radius) / old_radius > 0.001:
-                    logging.info("Radius decreased. Check what is going on?")
-
                 # Log the newly found point (together with the direction
                 # that generated it), both in cache and debug directories.
                 # These are non-scaled values. Note that the direction is
                 # already added at this point.
                 points.loc[points.index[-1] + 1] = p
-                for d in [cache_dir, debug_dir]:
-                    points.to_csv(os.path.join(d, "points.csv"))
+                points.to_csv(os.path.join(cache_dir, "points.csv"))
+                pd.DataFrame(probed_directions, columns=points.columns).to_csv(
+                    os.path.join(cache_dir, "probed_directions.csv")
+                )
+                # Be more careful about writing to the debug directory
+                # in case it's not available.
+                try:
+                    points.to_csv(os.path.join(debug_dir, "points.csv"))
                     pd.DataFrame(probed_directions, columns=points.columns).to_csv(
-                        os.path.join(d, "probed_directions.csv")
+                        os.path.join(debug_dir, "probed_directions.csv")
                     )
+                except:
+                    logging.warning(
+                        "Could not write points or probed direction to debug directory."
+                    )
+
+                # The network was already exported to a file by the
+                # worker process, and back in the main loop we can
+                # give it the correct name. Note that this can fail if
+                # exporting the network failed in the first place.
+                try:
+                    os.rename(
+                        n_opt_name,
+                        os.path.join(debug_dir, f"network_{num_iters}.nc"),
+                    )
+                except FileNotFoundError:
+                    logging.warning("Could not find debug network file to rename.")
+
+                # Re-generate the hull with the point added. Ensure everything is scaled.
+                current_points = points / scaling_ranges
+                scaled_hull.hull = ConvexHull(
+                    current_points.to_numpy(), qhull_options=qhull_options
+                )
+
+                # Compute new Chebyshev centre and radius. Include a sanity
+                # check that the radius does not decrease!
+                centre, radius, _ = ch_centre(scaled_hull.hull)
+                old_radius = iteration_data.radius.iloc[-1]
+                if (old_radius - radius) / old_radius > 0.001:
+                    logging.info("Radius decreased. Check what is going on?")
 
                 # Also write additional information about the new centre
                 # point, radius and volume to the debug directory. These
                 # come from the scaled near-optimal space.
                 iteration_data.loc[iteration_data.index[-1] + 1] = np.hstack(
-                    (centre, radius, scaled_hull.volume)
+                    (centre, radius, scaled_hull.hull.volume)
                 )
-                iteration_data.to_csv(os.path.join(debug_dir, "debug.csv"))
+                try:
+                    iteration_data.to_csv(os.path.join(debug_dir, "debug.csv"))
+                except:
+                    logging.warning("Could not write debug.csv file.")
 
                 # Evaluate convergence criteria. We need at least 2
                 # iterations to do this.
@@ -413,11 +502,27 @@ def compute_near_opt(
                 # Try generating a new direction and give it to a
                 # worker.
                 try:
-                    dir = next(dir_gen)
-                    if dir is not None:
-                        probed_directions.append(dir)
-                        args = (queue, m, dir, basis, obj_bound)
-                        results.append(pool.apply_async(solve_worker, args))
+                    scaled_d = next(dir_gen)
+                    if scaled_d is not None:
+                        # We have a new direction. First add it to the
+                        # list of probed directions (which live in
+                        # scaled space).
+                        probed_directions.append(scaled_d)
+                        # Now scale it back to the original space.
+                        d = scaled_d / scaling_ranges.values
+                        d = d / np.linalg.norm(d)
+                        args = (
+                            queue,
+                            m,
+                            d,
+                            basis,
+                            obj_bound,
+                            write_lock,
+                            debug_dir,
+                        )
+                        results.append(
+                            pool.apply_async(solve_worker, args, error_callback=print)
+                        )
                     else:
                         # We've (possibly temporarily) ran out of
                         # directions. Can try again after the next
@@ -452,8 +557,8 @@ def compute_near_opt(
 
     # Now reverse the scaling to obtain non-scaled "real" values.
     scaled_points = points / scaling_ranges
-    scaled_hull = ConvexHull(scaled_points.to_numpy(), qhull_options=qhull_options)
-    scaled_vertices = scaled_hull.points[scaled_hull.vertices, :]
+    scaled_hull.hull = ConvexHull(scaled_points.to_numpy(), qhull_options=qhull_options)
+    scaled_vertices = scaled_hull.hull.points[scaled_hull.hull.vertices, :]
     vertices = scaled_vertices * scaling_ranges.values
     return vertices
 
@@ -464,6 +569,8 @@ def solve_worker(
     dir: np.array,
     basis: OrderedDict,
     obj_bound: float,
+    write_lock: threading.Lock,
+    debug_dir: str,
 ) -> None:
     """Solve a network in a given direction and put the results in a queue.
 
@@ -486,6 +593,25 @@ def solve_worker(
     solve_time = round(time.time() - t)
     print(f"{worker_name}: Finishing optimisation in {solve_time} seconds.")
 
+    # Store the network. Note: using a write lock here is a tad
+    # defensive, but it appears that things can sometimes get blocked
+    # otherwise.
+    fn = os.path.join(debug_dir, f"{worker_name}.nc")
+    with write_lock:
+        # Catch any filesystem errors we might get while trying to
+        # write the network.
+        try:
+            r.export_to_netcdf(
+                fn,
+                compression={
+                    "complevel": 1,
+                    "zlib": True,
+                    "least_significant_digit": 3,
+                },
+            )
+        except Exception as e:
+            print(f"{worker_name}: Failed to write network to {fn} with error {e}.")
+
     # Put the result in the result queue if the optimisation was
     # successful. If unsuccessful, put a None in the queue. This may
     # happen sporadically due to, for example, numerical issues. Note
@@ -493,13 +619,13 @@ def solve_worker(
     # if there is only one parallel process) the main program loop
     # will get stuck waiting for a result.
     if status == "ok":
-        queue.put(get_basis_values(r, basis))
+        queue.put((get_basis_values(r, basis), fn))
     else:
-        queue.put(None)
+        queue.put((None, None))
 
 
 def large_facet_directions(
-    hull: ConvexHull,
+    hull: Wrapper[ConvexHull],
     probed_directions: Collection[np.array],
     init_min_angle: float = 10.0,
     autodecrease: bool = False,
@@ -517,7 +643,9 @@ def large_facet_directions(
 
     The arguments `hull` and `probed_directions` are taken as
     references and may change between each iteration of this
-    generator.
+    generator. In particular, `hull` should be a wrapper for a convex
+    hull such that the hull contained by the wrapper can be changed /
+    redifined outside of this generator.
 
     This generator never terminates, and instead returns None when it
     runs out of directions. This is so that it can "try again" after
@@ -526,7 +654,7 @@ def large_facet_directions(
 
     Parameters
     ----------
-    hull : ConvexHull
+    hull : Wrapper[ConvexHull]
         Based on this convex hull, generate directions by its facets.
     probed_directions : Collection[np.array]
         Filter the directions based on this collection.
@@ -546,7 +674,7 @@ def large_facet_directions(
     while True:
         # Get the normals for the current hull. (Note that `hull` is
         # updated for every iteration.)
-        normals = facet_normals(hull)
+        normals = facet_normals(hull.hull)
         try:
             # Filter out directions close to ones we have seen before,
             # and return the first one.
@@ -569,7 +697,7 @@ def large_facet_directions(
 
 
 def touching_ball_directions(
-    hull: ConvexHull,
+    hull: Wrapper[ConvexHull],
     probed_directions: Collection[np.array],
     angle_tolerance: float,
 ):
@@ -583,7 +711,9 @@ def touching_ball_directions(
 
     The arguments `hull` and `probed_directions` are taken as
     references and may change between each iteration of this
-    generator.
+    generator. In particular, `hull` should be a wrapper for a convex
+    hull such that the hull contained by the wrapper can be changed /
+    redifined outside of this generator.
 
     Note that we do not decrease the angles here as we already start
     with a very low threshold to exploit the touching directions precisely
@@ -596,7 +726,7 @@ def touching_ball_directions(
 
     Parameters
     ----------
-    hull : ConvexHull
+    hull : Wrapper[ConvexHull]
         Based on this convex hull, generate directions by its facets.
     probed_directions : Collection[np.array]
         Filter the directions based on this collection.
@@ -609,7 +739,7 @@ def touching_ball_directions(
         # constraints which are tight in the resulting LP. These
         # constraints are exactly the normal vectors of the
         # hyperplanes of `hull` touching the centre ball.
-        _, _, tight_constraints = ch_centre(hull)
+        _, _, tight_constraints = ch_centre(hull.hull)
         # Just yield any of the normals that is not too close to
         # something we have tried before.
         try:
@@ -625,7 +755,7 @@ def touching_ball_directions(
 
 
 def maximal_centre_then_facets(
-    hull: ConvexHull,
+    hull: Wrapper[ConvexHull],
     probed_directions: Collection[np.array],
     init_min_facet_angle: float = 10.0,
     angle_tolerance: float = 0.1,
@@ -639,9 +769,15 @@ def maximal_centre_then_facets(
     facets are returned instead. Once these are exhausted, we reduce
     the angle threshold automatically by 20%.
 
+    The arguments `hull` and `probed_directions` are taken as
+    references and may change between each iteration of this
+    generator. In particular, `hull` should be a wrapper for a convex
+    hull such that the hull contained by the wrapper can be changed /
+    redifined outside of this generator.
+
     Parameters
     ----------
-    hull : ConvexHull
+    hull : Wrapper[ConvexHull]
         Based on this convex hull, generate directions by its facets.
     probed_directions : Collection[np.array]
         Filter the directions based on this collection.
@@ -682,6 +818,79 @@ def maximal_centre_then_facets(
             logging.info(f"Decreasing allowed angle between directions to {a}.")
 
 
+def maximal_centre_then_facets_then_random(
+    hull: Wrapper[ConvexHull],
+    probed_directions: Collection[np.array],
+    dims: int,
+    init_min_facet_angle: float = 10.0,
+    angle_tolerance: float = 0.1,
+):
+    """Generate directions from centre ball, then facets, then random.
+
+    For each iteration of this generator, it is first checked if there
+    are any normal vectors of facets touched by the centre ball of
+    `hull` which have not been probed yet. If such a vector is found,
+    it is yielded. If not, the normal vectors of the largest unchecked
+    facets are returned instead. Once these are exhausted, we reduce
+    the angle threshold automatically by 20%. As a last resort, once
+    the angle threshold has been reduced below the `angle_tolerance`,
+    we yield uniformly random directions instead.
+
+    The arguments `hull` and `probed_directions` are taken as
+    references and may change between each iteration of this
+    generator. In particular, `hull` should be a wrapper for a convex
+    hull such that the hull contained by the wrapper can be changed /
+    redifined outside of this generator.
+
+    Parameters
+    ----------
+    hull : Wrapper[ConvexHull]
+        Based on this convex hull, generate directions by its facets.
+    probed_directions : Collection[np.array]
+        Filter the directions based on this collection.
+    init_min_angle : float
+        First angle threshold for filtering before possible reductions.
+    min_angle_tolerance : float
+        Minimal threshold for direction filtering. Below it, the
+        direction generation ends, as we have exhausted the possible
+        vectors.
+
+    """
+    a = init_min_facet_angle
+    while True:
+        # First try generating a direction using the centre ball. This
+        # generator yields None if nothing was found.
+        d = next(touching_ball_directions(hull, probed_directions, angle_tolerance))
+        if d is not None:
+            logging.info("Generated direction based on maximal-centre.")
+            yield d
+            continue
+
+        # In case we did not find any new directions from the facets
+        # touching the centre ball, go with normal directions to large
+        # facets.
+        d = next(large_facet_directions(hull, probed_directions, a))
+        if d is not None:
+            logging.info("Generated direction based on largest facet.")
+            yield d
+        else:
+            # If we ran out of directions here, decrease the minimum
+            # allowed angle between probed directions (until we reach
+            # an absolute minimum).
+            a *= 0.8
+
+            if a < angle_tolerance:
+                # At this point we have really run out of facet normal
+                # directions. We simply yield random directions from
+                # now.
+                random_sampler = uniform_random_hypersphere_sampler(dims)
+                while True:
+                    logging.info("Generated uniformly random direction.")
+                    yield next(random_sampler)
+            else:
+                logging.info(f"Decreasing allowed angle between directions to {a}.")
+
+
 def dist(x: np.array, y: np.array) -> float:
     """Compute the Euclidean distance between x and y."""
     return np.linalg.norm(x - y)
@@ -713,38 +922,41 @@ def reuse_results(
     pd.DataFrame
         A collection of points in the basis of `basis` that were
         previously generated with this configuration.
-    Collection[np.array]
+    List[np.array]
         Previously probed directions.
     pd.DataFrame
         Previous iteration data (centre, radius, volume).
     int
         Number of previous iterations with this configuration.
     """
+    logging.info(
+        f"Trying to reuse results in cache {cache_dir} and debug data in {debug_dir}"
+    )
+    # First try to read cached results.
     try:
         # Read points and directions files.
         points = pd.read_csv(os.path.join(cache_dir, "points.csv"), index_col=0)
-        probed_directions = pd.read_csv(
-            os.path.join(cache_dir, "probed_directions.csv"), index_col=0
+        probed_directions = list(
+            pd.read_csv(
+                os.path.join(cache_dir, "probed_directions.csv"), index_col=0
+            ).values
         )
+        previous_iters = max(0, len(probed_directions) - 2 * len(basis))
+    except OSError:
+        logging.info("No previous runs with this configuration found.")
+        return None, None, None, 0
+
+    # Now try reading debug data from previous runs.
+    try:
         previous_debug = pd.read_csv(os.path.join(debug_dir, "debug.csv"), index_col=0)
-        probed_directions = list(probed_directions.values)
         # Calculate the number of iterations that were performed. Note
         # that `probed_directions` (and `points`) contain data from
         # MGA iterations, so we subtract the number of MGA iterations
         # (which is 2*`len(basis)`).
-        previous_iters = max(0, len(probed_directions) - 2 * len(basis))
     except OSError:
-        logging.info(
-            "No previous runs with this configuration found. Start with num_iters = 0."
-        )
-        return None, None, None, 0
+        logging.info("Found cached results but no debug data from previous runs.")
+        return points, probed_directions, None, previous_iters
 
-    try:
-        # Also try to read previous debug information if possible.
-        previous_debug = pd.read_csv(os.path.join(debug_dir, "debug.csv"), index_col=0)
-    except (OSError, TypeError):
-        logging.info("Could not find debug data, use only cached data.")
-        previous_debug = None
     return points, probed_directions, previous_debug, previous_iters
 
 
@@ -756,11 +968,14 @@ if __name__ == "__main__":
     pypsa_logger = logging.getLogger("pypsa")
     pypsa_logger.setLevel(logging.WARNING)
 
-    # Load the network.
-    n = pypsa.Network(snakemake.input.network)
+    # Load the network and solving options.
+    overrides = override_component_attrs(snakemake.params.overrides)
+    n = pypsa.Network(snakemake.input.network, override_component_attrs=overrides)
 
     # Attach solving configuration to the network.
-    n.config = snakemake.config["pypsa-eur"]
+    # TODO: what if we run this with pypsa-eur, not pypsa-eur-sec?
+    n.config = snakemake.config["pypsa-eur-sec"]
+    n.opts = parse_net_spec(snakemake.wildcards.spec)["sector_opts"].split("-")
 
     # Load the points generated during MGA.
     mga_space = pd.read_csv(snakemake.input.mga_space, index_col=0)
@@ -784,12 +999,12 @@ if __name__ == "__main__":
         conv_eps=float(snakemake.config["near_opt_approx"]["conv_epsilon"]),
         conv_iter=int(snakemake.config["near_opt_approx"]["conv_iterations"]),
         max_iter=int(snakemake.config["near_opt_approx"]["iterations"]),
-        debug_dir=snakemake.log.iterations,
-        cache_dir=snakemake.log.cache,
+        debug_dir=snakemake.params.iterations,
+        cache_dir=snakemake.params.cache,
         num_parallel_solvers=snakemake.config["near_opt_approx"].get(
             "num_parallel_solvers", 1
         ),
-        qhull_options=snakemake.config["near_opt_approx"].get("qhull_options", None),
+        qhull_options=snakemake.config["near_opt_approx"]["qhull_options"]["near_opt"],
         angle_tolerance=snakemake.config["near_opt_approx"].get("angle_tolerance", 0.1),
     )
 
