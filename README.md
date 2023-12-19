@@ -6,7 +6,7 @@ SPDX-License-Identifier: CC-BY-4.0
 
 # Introduction
 
-This repository contains the code for reproducing the results presented in _Enabling agency: trade-offs between regional and integrated energy systems design flexibility_ (under review). In the paper, we develop a novel decomposition of the near-optimal space of energy system optimisation models into regional components. This allows us to study trade-offs in investment and design flexibility between different regions in Europe.
+This repository contains the code for reproducing the results presented in [_Enabling agency: trade-offs between regional and integrated energy systems design flexibility_](https://arxiv.org/abs/2312.11264) (under review). In the paper, we develop a novel decomposition of the near-optimal space of energy system optimisation models into regional components. This allows us to study trade-offs in investment and design flexibility between different regions in Europe.
 
 The present codebase is an evolution of the code presented [here](https://github.com/aleks-g/intersecting-near-opt-spaces/) (and part of [this paper](https://doi.org/10.1016/j.eneco.2022.106496)), with the main changes being:
 - The use of the sector-coupled model pypsa-eur-sec instead of pypsa-eur;
