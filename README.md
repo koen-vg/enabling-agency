@@ -85,11 +85,11 @@ A configuration file needs to have a name (corresponding to the file name of the
 
 # Data
 
-We are using data from the same sources that PyPSA-Eur and PyPSA-Eur-Sec do, however with some slight variations.
+We are using data from the same sources that PyPSA-Eur and PyPSA-Eur-Sec do, however with some slight variations:
 
 ## Cost data
 
-We use cost data as in PyPSA-Eur from the [technology data](https://github.com/PyPSA/technology-data) repository.
+We use cost data as in PyPSA-Eur from the [technology data](https://github.com/PyPSA/technology-data) repository. In the `expensive_wind` and `expensive_solar` scenarios we use the upper limits of 2050 cost data  of the Danish Energy Agency.
 
 ## Weather and renewable resource data
 
@@ -101,6 +101,6 @@ These cutouts must be downloaded manually.
 
 ## Load data
 
-We use an artificial electricity demand dataset through an regression on ENTSO-E load data and temperature influence on it (per country) following PyPSA-Eur.
+We use an artificial electricity demand dataset (v.0.1.0) through an regression on ENTSO-E load data and temperature influence on it (per country) [DOI: 10.5281/zenodo.7070438](https://doi.org/10.5281/zenodo.7070438) developed by Martha Frysztacki, Lieke van der Most, and Fabian Neumann. When the `retrieve_artificial_load_data` setting is activated in PyPSA-Eur (as in our configuration file), it is used automatically.
 
 
